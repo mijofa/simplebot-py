@@ -1,7 +1,10 @@
 #!/usr/bin/python
 import multiprocessing
 import pyfirmata
+import termios
+import threading
 import time
+import types
 
 SPEED = 10
 
@@ -145,60 +148,201 @@ class distance_sensor():
         self.board.send_sysex(0x74, data)
 
 ###
-### Functions for binding to keys
-## The first argument will always be the current gear
-## If the function returns anything other than None then it will be the new gear.
-def accel(gear):
-    if leds.indicating:
-        indicate_stop(gear)
-    if   gear <  0:
-        move.backward(gear*-SPEED)
-    elif gear == 0:
-        pass
-    elif gear >  0:
-        move.forward(gear*SPEED)
-def brake(gear = None):
-    for i in (LEDS_BACK):
-        leds.set(i, COLOUR_RED)
-    leds.push()
-    move.stop()
-def left(gear):
-    if leds.indicating and not prev_state in ('left', 'indicate_left'):
-        indicate_stop(gear)
-    # I'm not sure how intuitive this will be, but if we are reversing spin right instead of left
-    if   gear <  0:
-        move.right(gear*-SPEED)
-    elif gear == 0:
-        pass
-    elif gear >  0:
-        move.left(gear*SPEED)
-def right(gear):
-    if leds.indicating and not prev_state in ('right', 'indicate_right'):
-        indicate_stop(gear)
-    # I'm not sure how intuitive this will be, but if we are reversing spin left instead of right
-    if   gear <  0:
-        move.left(gear*-SPEED)
-    elif gear == 0:
-        pass
-    elif gear >  0:
-        move.right(gear*SPEED)
-def indicate_left(gear = None):
-    leds.indicate(LEDS_LEFT)
-def indicate_right(gear = None):
-    leds.indicate(LEDS_RIGHT)
-def indicate_stop(gear = None):
-    leds.indicate(None)
-def gear_up(gear):
-    if gear == 1:
-        # This should disable reversing rather than just reseting
-        leds.reset()
-    return gear+1
-def gear_down(gear):
-    if gear <= 0:
+### State classes
+###
+class state_handler():
+    def __init__(self):
+        self.gear = 0
+        self.current_states = {}
+    def add(self, state_class):
+        assert type(state_class) == types.ClassType
+        state = state_class(self)
+        for conflict in state.conflicts:
+            if conflict in self.current_states:
+                self.remove(conflict)
+        if state.enter_state() == True:
+            self.current_states.update({state.name: state})
+        return self.current_states
+    def remove(self, state):
+        assert type(state) == types.ClassType or type(state) == str or type(state) == instance
+        if   type(state) == types.InstanceType:
+            if state not in self.current_states.value():
+                return self.current_states
+            else:
+                state_name = state.name
+        elif type(state) == types.ClassType:
+            state_name = state.name
+        elif type(state) == str:
+            state_name = state
+        if state_name in self.current_states:
+            self.current_states.pop(state_name).leave_state()
+        return self.current_states
+    def change_gear(self, gear):
+        assert type(gear) == int
+        if gear > 6:
+            gear = 6
+        elif gear < -1:
+            gear = -1
+        self.gear = gear
+        for state_name, state in self.current_states.items():
+            if state.gear_change() == False:
+                self.current_states.pop(state_name)
+        return self.gear
+    def shutdown(self):
+        keys = self.current_states.keys()
+        for state in keys:
+            self.remove(state)
+class state():
+    name         = ''
+    conflicts    = []
+    dependencies = []
+    def __init__(self, handler):
+        self.handler = handler
+    def gear_change(self):
+        return self._on_gear_change()
+    def enter_state(self):
+        return self._on_enter()
+    def leave_state(self):
+        return self._on_leave()
+    def _on_gear_change(self):
+        return True
+    def _on_enter(self):
+        return True
+    def _on_leave(self):
+        return True
+class gear_up(state):
+    name         = 'gear_up'
+    conflicts    = ['gear_down']
+    def _on_enter(self):
+        self.handler.change_gear(self.handler.gear+1)
+        return False
+class gear_down(state):
+    name         = 'gear_down'
+    conflicts    = ['gear_up']
+    def _on_enter(self):
+        self.handler.change_gear(self.handler.gear-1)
+        return False
+class forward(state):
+    name         = 'forward'
+    conflicts    = ['indicate_left', 'indicate_right', 'left', 'right', 'brake', 'reverse']
+    def _on_gear_change(self):
+        return self.go()
+    def _on_enter(self):
+        return self.go()
+    def _on_leave(self):
+        move.stop()
+        return True
+    def go(self):
+        if   self.handler.gear <  0:
+            self.handler.add(reverse)
+            return False
+        elif self.handler.gear == 0:
+            self.leave_state()
+            return False
+        elif self.handler.gear >  0:
+            self.leave_state()
+            move.forward(self.handler.gear*SPEED)
+            return True
+class reverse(state):
+    name         = 'reverse'
+    conflicts    = ['indicate_left', 'indicate_right', 'left', 'right', 'brake', 'forward']
+    def _on_gear_change(self):
+        return self.go()
+    def _on_enter(self):
         for i in (LEDS_BACK):
             leds.set(i, COLOUR_WHITE)
         leds.push()
-    return gear-1
+        return self.go()
+    def _on_leave(self):
+        move.stop()
+        return True
+    def go(self):
+        if   self.handler.gear <  0:
+            move.backward(self.handler.gear*-SPEED)
+            return True
+        elif self.handler.gear == 0:
+            self.leave_state()
+            return False
+        elif self.handler.gear >  0:
+            self.leave_state()
+            self.handler.add(forward)
+            return False
+class left(state):
+    name         = 'left'
+    conflicts    = ['indicate_right', 'right', 'brake', 'forward']
+    def _on_gear_change(self):
+        return self.go()
+    def _on_enter(self):
+        return self.go()
+    def _on_leave(self):
+        move.stop()
+        return True
+    def go(self):
+        if   self.handler.gear <  0:
+            move.right(self.handler.gear*-SPEED)
+            return True
+        elif self.handler.gear == 0:
+            self.leave_state()
+            return False
+        elif self.handler.gear >  0:
+            move.left(self.handler.gear*SPEED)
+            return True
+class right(state):
+    name         = 'right'
+    conflicts    = ['indicate_left', 'left', 'brake', 'forward']
+    def _on_gear_change(self):
+        return self.go()
+    def _on_enter(self):
+        return self.go()
+    def _on_leave(self):
+        move.stop()
+        return True
+    def go(self):
+        if   self.handler.gear <  0:
+            move.left(self.handler.gear*-SPEED)
+            return True
+        elif self.handler.gear == 0:
+            self.leave_state()
+            return False
+        elif self.handler.gear >  0:
+            move.right(self.handler.gear*SPEED)
+            return True
+class brake(state):
+    name         = 'brake'
+    conflicts    = ['left', 'right', 'forward', 'reverse']
+    def _on_enter(self):
+        for i in (LEDS_BACK):
+            leds.set(i, COLOUR_RED)
+        leds.push()
+        move.stop()
+        return True
+    def _on_leave(self):
+        for i in (LEDS_BACK):
+            leds.set(i, COLOUR_BLACK)
+        leds.push()
+        return True
+class indicate_left(state):
+    name         = 'indicate_left'
+    conflicts    = ['indicate_right']
+    def _on_enter(self):
+        print 'starting left indicator'
+        leds.indicate(LEDS_LEFT)
+        return True
+    def _on_leave(self):
+        print 'disabling left indicator'
+        leds.indicate(None)
+        return True
+class indicate_right(state):
+    name         = 'indicate_right'
+    conflicts    = ['indicate_left']
+    def _on_enter(self):
+        print 'starting right indicator'
+        leds.indicate(LEDS_RIGHT)
+        return True
+    def _on_leave(self):
+        print 'disabling right indicator'
+        leds.indicate(None)
+        return True
 
 ###
 ### Initialisations
@@ -219,15 +363,14 @@ it.start()
 move = movement_controller(board,9,10,93,94) # 93 & 94 are magic numbers, but they're my magic numbers. These should be set in a config file in /boot
 leds = led_controller(board,4)
 dist = distance_sensor(board, 8)
+stat = state_handler()
 
 if __name__ == '__main__':
     import sys, tty
 
-    fd = sys.stdin.fileno()
-    tty.setcbreak(fd)
 
     bindings = { # This should probably be configurable, but this is reasonable defaults
-        'w':     accel,
+        'w':     forward,
         's':     brake,
         'a':     left,
         'd':     right,
@@ -237,16 +380,24 @@ if __name__ == '__main__':
         'right': indicate_right,
     }
 
-    prev_state = None
-    board.digital[13].write(1) # Turn on the blink LED to let the user know we are ready to go.
-    def f(value, cm, inches):
-        print "Distance:", cm, "cm"
-    dist.callback = f
-    while True:
-        dist.pulse()
-        key = sys.stdin.read(1)
-#        sys.stdout.write(key)
+    def f():
+        while True:
+            dist.pulse()
+            sys.stdout.write("%d %06.2f %s\n" % (stat.gear, dist.cm, stat.current_states.keys()))
+            time.sleep(1)
+    t = threading.Thread(target=f)
+    t.setDaemon(True)
+    t.start()
 
+    old_term_settings = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+
+    board.digital[13].write(1) # Turn on the blink LED to let the user know we are ready to go.
+    while True:
+        key = sys.stdin.read(1)
+
+        if ord(key) == 4: # ^d
+            break
         if ord(key) == 27: # Esc
             key = sys.stdin.read(1)
             if ord(key) == 91: # I don't actually understand the numbers now, but all the arrow keys had this next
@@ -260,16 +411,11 @@ if __name__ == '__main__':
                 elif ord(key) == 68: # left
                     key = 'left'
         if key in bindings.keys():
-            print gear, bindings[key].__name__
-            ret = bindings[key](gear)
-            if ret != None:
-                gear = ret
-            prev_state = bindings[key].__name__
-        elif ord(key) == 4: # ^d
-            break
+            stat.add(bindings[key])
 
+    stat.shutdown()
     board.digital[13].write(0)
-    leds.reset()
-    move.stop()
+
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term_settings)
 
 # python -i -c 'import pyfirmata,simplebot ; b = pyfirmata.Arduino("/dev/ttyS99") ; it = pyfirmata.util.Iterator(b) ; it.setDaemon(True) ; it.start()'
