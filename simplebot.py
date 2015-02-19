@@ -72,13 +72,16 @@ class led_controller():
                 last_time = time.time()
     def indicate(self, leds):
         assert leds == None or (leds[0] < len(self.leds) and leds[0] >= 0 and leds[1] < len(self.leds) and leds[1] >= 0)
+        print 'indicating'
         if self.indicating == True:
+            print 'terminating'
             self._indicator_process.terminate() # Stop any indicator process currently running
             self.set(self._indicator_process._args[0][0], COLOUR_BLACK) # Reset the state of the LED that process was flashing
             self.set(self._indicator_process._args[0][1], COLOUR_BLACK) # Reset the state of the LED that process was flashing
             self.push()
             self.indicating = False
         if leds != None:
+            self.indicating = True
             self._indicator_process = multiprocessing.Process(target=self._indicator, args=[leds], name='indicator %d %d' % leds)
             self._indicator_process.start()
 
@@ -111,6 +114,9 @@ class distance_sensor():
     ### I spent hours trying to makes sense of how the node.js code did all this before giving up and just copying magic numbers from what the node.js code did.
     # FIXME: Make sense of this.
     callback = None
+    value    = 0
+    cm       = 0
+    inches   = 0
     def __init__(self, board, pin): # I don't know enough about the firmata code to separate trigpin and echopin
         self.board = board
         self.pin   = pin
