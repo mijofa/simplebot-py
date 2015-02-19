@@ -254,6 +254,9 @@ class reverse(state):
         leds.push()
         return self.go()
     def _on_leave(self):
+        for i in (LEDS_BACK):
+            leds.set(i, COLOUR_BLACK)
+        leds.push()
         move.stop()
         return True
     def go(self):
